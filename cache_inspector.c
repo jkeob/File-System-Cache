@@ -69,7 +69,8 @@ double check_file_cache(const char *filepath) {
 
     long page_size = sysconf(_SC_PAGESIZE);
     size_t pages = (st.st_size + page_size - 1) / page_size;
-    void *addr = mmap(NULL, st.st_size, PROT_NONE, MAP_SHARED, fd, 0);
+
+    void *addr = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) { close(fd); return -1.0; }
 
     unsigned char *vec = calloc(1, pages);
