@@ -12,7 +12,6 @@
 #include <stdint.h>
 
 #define MAX_PIDS 4096
-#define KPF_PRESENT (1ULL << 0)
 
 typedef struct {
     int pid;
@@ -23,9 +22,6 @@ typedef struct {
     double score;
 } ProcInfo;
 
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
 void get_process_name(int pid, char *name_buf, size_t size) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
@@ -62,96 +58,78 @@ unsigned long long get_cpu_time(int pid) {
     return utime + stime;
 }
 
-double check_file_cache(const char *filepath) {
-    int fd = open(filepath, O_RDONLY);
-    if (fd < 0) return -1.0;
 
+double check_file_cache(const char *filepath) {
+    // Try to open the file
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        // printf("[DEBUG] open failed: %s\n", filepath);
+        return -1.0;
+    }
+
+    // Stat the file
     struct stat st;
     if (fstat(fd, &st) < 0) {
         close(fd);
         return -1.0;
     }
 
+    // Empty file → 0% cached
     if (st.st_size == 0) {
         close(fd);
         return 0.0;
     }
 
     long page_size = sysconf(_SC_PAGESIZE);
-    size_t npages = (st.st_size + page_size - 1) / page_size;
+    size_t pages = (st.st_size + page_size - 1) / page_size;
 
-    // Map the file into memory (private mapping is fine)
-    uint8_t *addr = mmap(NULL, npages * page_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    // Map the file — PROT_NONE so we don't fault pages
+    void *addr = mmap(NULL, st.st_size, PROT_NONE, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
         close(fd);
         return -1.0;
     }
 
-    // Open pagemap and kpageflags
-    int pm_fd = open("/proc/self/pagemap", O_RDONLY);
-    int kf_fd = open("/proc/kpageflags", O_RDONLY);
-
-    if (pm_fd < 0 || kf_fd < 0) {
-        munmap(addr, npages * page_size);
+    // Allocate mincore vector
+    unsigned char *vec = calloc(pages, 1);
+    if (!vec) {
+        munmap(addr, st.st_size);
         close(fd);
-        if (pm_fd >= 0) close(pm_fd);
-        if (kf_fd >= 0) close(kf_fd);
         return -1.0;
     }
 
-    size_t cached = 0;
-
-    for (size_t i = 0; i < npages; i++) {
-        uint64_t pagemap_entry;
-        off_t pm_offset = ((uintptr_t)addr / page_size + i) * sizeof(uint64_t);
-
-        // Read pagemap entry for this page
-        if (pread(pm_fd, &pagemap_entry, sizeof(pagemap_entry), pm_offset) != sizeof(pagemap_entry)) {
-            continue;
-        }
-
-        // Check if page is mapped to a physical frame
-        if (!(pagemap_entry & (1ULL << 63))) {
-            continue;  // not present
-        }
-
-        // PFN (Page Frame Number)
-        uint64_t pfn = pagemap_entry & ((1ULL << 55) - 1);
-
-        // Read flags for this PFN
-        uint64_t flags;
-        off_t kf_offset = pfn * sizeof(uint64_t);
-
-        if (pread(kf_fd, &flags, sizeof(flags), kf_offset) != sizeof(flags)) {
-            continue;
-        }
-
-        // Check PRESENT bit
-        if (flags & KPF_PRESENT) {
-            cached++;
-        }
+    // Core call — check residency
+    if (mincore(addr, st.st_size, vec) != 0) {
+        free(vec);
+        munmap(addr, st.st_size);
+        close(fd);
+        return -1.0;
     }
 
-    close(pm_fd);
-    close(kf_fd);
-    munmap(addr, npages * page_size);
+    // Count resident pages
+    size_t cached = 0;
+    for (size_t i = 0; i < pages; i++) {
+        if (vec[i] & 1)   // lowest bit = resident
+            cached++;
+    }
+
+    double pct = (cached * 100.0) / pages;
+
+    free(vec);
+    munmap(addr, st.st_size);
     close(fd);
 
-    return (cached * 100.0) / npages;
+    return pct;
 }
 
-// ─────────────────────────────────────────────
-// Sort by combined impact score
-// ─────────────────────────────────────────────
+
 int cmp_score(const void *a, const void *b) {
     double sa = ((ProcInfo*)a)->score;
     double sb = ((ProcInfo*)b)->score;
-    return (sb > sa) - (sb < sa); // descending
+    return (sb > sa) - (sb < sa);
 }
 
-// ─────────────────────────────────────────────
-// Gather processes and compute score
-// ─────────────────────────────────────────────
+
 int gather_processes(ProcInfo infos[], unsigned long long prev_cpu[]) {
     DIR *proc = opendir("/proc");
     if (!proc) return 0;
@@ -169,6 +147,7 @@ int gather_processes(ProcInfo infos[], unsigned long long prev_cpu[]) {
         get_process_name(pid, p->name, sizeof(p->name));
         p->mem_kb = get_memory_usage_kb(pid);
 
+        // CPU calculation
         unsigned long long cpu_now = get_cpu_time(pid);
         double cpu_pct = 0.0;
         if (prev_cpu[pid] != 0) {
@@ -178,12 +157,46 @@ int gather_processes(ProcInfo infos[], unsigned long long prev_cpu[]) {
         prev_cpu[pid] = cpu_now;
         p->cpu = cpu_pct;
 
+        // Default: cache residency of the executable binary
         char exe_path[PATH_MAX], real_exe[PATH_MAX];
         snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", pid);
         ssize_t len = readlink(exe_path, real_exe, sizeof(real_exe) - 1);
-        p->cache = (len != -1) ? check_file_cache(real_exe) : 0.0;
+        p->cache = (len != -1) ? check_file_cache(real_exe) : -1.0;
 
-        // compute weighted impact score
+        // ─────────────────────────────────────────────
+        // NEW: Override cache% if process has bigfile.bin open
+        // ─────────────────────────────────────────────
+        char fd_dir_path[PATH_MAX];
+        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
+
+        DIR *fd_dir = opendir(fd_dir_path);
+        if (fd_dir) {
+            struct dirent *fde;
+
+            while ((fde = readdir(fd_dir)) != NULL) {
+                if (!isdigit(fde->d_name[0])) continue;
+
+                char link_path[PATH_MAX];
+                char target_path[PATH_MAX];
+
+                snprintf(link_path, sizeof(link_path), "%s/%s", fd_dir_path, fde->d_name);
+
+                ssize_t tlen = readlink(link_path, target_path, sizeof(target_path) - 1);
+                if (tlen <= 0) continue;
+
+                target_path[tlen] = '\0';
+
+                // If it is reading bigfile.bin → use that cache residency
+                if (strstr(target_path, "bigfile.bin") != NULL) {
+                    p->cache = check_file_cache(target_path);
+                    break;
+                }
+            }
+
+            closedir(fd_dir);
+        }
+
+        // Compute weighted impact score
         double mem_mb = p->mem_kb / 1024.0;
         p->score = (p->cpu * 0.6) + (mem_mb * 0.3) + (p->cache * 0.1);
 
@@ -194,9 +207,6 @@ int gather_processes(ProcInfo infos[], unsigned long long prev_cpu[]) {
     return count;
 }
 
-// ─────────────────────────────────────────────
-// Display ranked list
-// ─────────────────────────────────────────────
 void show_top(ProcInfo infos[], int count) {
     printf("%-6s %-22s %8s %12s %10s %10s\n",
            "PID", "Process", "CPU%", "Mem(KB)", "Cache%", "Score");
@@ -210,9 +220,6 @@ void show_top(ProcInfo infos[], int count) {
     }
 }
 
-// ─────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────
 int main(void) {
     unsigned long long prev_cpu[65536] = {0};
 
@@ -228,11 +235,13 @@ int main(void) {
         double total_cpu = 0.0;
         long total_mem = 0;
         double avg_cache = 0.0;
+
         for (int i = 0; i < count; i++) {
             total_cpu += infos[i].cpu;
             total_mem += infos[i].mem_kb;
             avg_cache += infos[i].cache;
         }
+
         if (count > 0) avg_cache /= count;
 
         printf("\nSystem-Wide Summary\n");
@@ -249,5 +258,6 @@ int main(void) {
         fflush(stdout);
         sleep(1);
     }
+
     return 0;
 }
