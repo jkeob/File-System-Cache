@@ -9,8 +9,10 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 
 #define MAX_PIDS 4096
+#define KPF_PRESENT (1ULL << 0)
 
 typedef struct {
     int pid;
@@ -63,31 +65,79 @@ unsigned long long get_cpu_time(int pid) {
 double check_file_cache(const char *filepath) {
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) return -1.0;
+
     struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return -1.0; }
-    if (st.st_size == 0) { close(fd); return 0.0; }
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return -1.0;
+    }
+
+    if (st.st_size == 0) {
+        close(fd);
+        return 0.0;
+    }
 
     long page_size = sysconf(_SC_PAGESIZE);
-    size_t pages = (st.st_size + page_size - 1) / page_size;
+    size_t npages = (st.st_size + page_size - 1) / page_size;
 
-    void *addr = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (addr == MAP_FAILED) { close(fd); return -1.0; }
+    // Map the file into memory (private mapping is fine)
+    uint8_t *addr = mmap(NULL, npages * page_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) {
+        close(fd);
+        return -1.0;
+    }
 
-    unsigned char *vec = calloc(1, pages);
-    if (!vec) { munmap(addr, st.st_size); close(fd); return -1.0; }
+    // Open pagemap and kpageflags
+    int pm_fd = open("/proc/self/pagemap", O_RDONLY);
+    int kf_fd = open("/proc/kpageflags", O_RDONLY);
 
-    if (mincore(addr, st.st_size, vec) != 0) {
-        free(vec); munmap(addr, st.st_size); close(fd); return -1.0;
+    if (pm_fd < 0 || kf_fd < 0) {
+        munmap(addr, npages * page_size);
+        close(fd);
+        if (pm_fd >= 0) close(pm_fd);
+        if (kf_fd >= 0) close(kf_fd);
+        return -1.0;
     }
 
     size_t cached = 0;
-    for (size_t i = 0; i < pages; i++) if (vec[i] & 1) cached++;
-    double pct = (cached * 100.0) / pages;
 
-    free(vec);
-    munmap(addr, st.st_size);
+    for (size_t i = 0; i < npages; i++) {
+        uint64_t pagemap_entry;
+        off_t pm_offset = ((uintptr_t)addr / page_size + i) * sizeof(uint64_t);
+
+        // Read pagemap entry for this page
+        if (pread(pm_fd, &pagemap_entry, sizeof(pagemap_entry), pm_offset) != sizeof(pagemap_entry)) {
+            continue;
+        }
+
+        // Check if page is mapped to a physical frame
+        if (!(pagemap_entry & (1ULL << 63))) {
+            continue;  // not present
+        }
+
+        // PFN (Page Frame Number)
+        uint64_t pfn = pagemap_entry & ((1ULL << 55) - 1);
+
+        // Read flags for this PFN
+        uint64_t flags;
+        off_t kf_offset = pfn * sizeof(uint64_t);
+
+        if (pread(kf_fd, &flags, sizeof(flags), kf_offset) != sizeof(flags)) {
+            continue;
+        }
+
+        // Check PRESENT bit
+        if (flags & KPF_PRESENT) {
+            cached++;
+        }
+    }
+
+    close(pm_fd);
+    close(kf_fd);
+    munmap(addr, npages * page_size);
     close(fd);
-    return pct;
+
+    return (cached * 100.0) / npages;
 }
 
 // ─────────────────────────────────────────────
